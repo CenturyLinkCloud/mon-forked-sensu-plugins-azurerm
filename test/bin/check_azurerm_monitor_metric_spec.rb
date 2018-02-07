@@ -13,7 +13,7 @@ describe 'check monitor metric script' do
   subject(:check_instance) { CheckAzurermMonitorMetric.new(script_args) }
   let(:script_args) do
     args = [
-      '--resource', resource_id,
+      '--resource-id', resource_id,
       '--metric', metric_name,
       '--critical', critical,
       '--warning', warning,
@@ -47,6 +47,7 @@ describe 'check monitor metric script' do
   let(:timespan) do
     start_date = Time.now.utc - 600
     end_date = Time.now.utc
+
     "#{start_date.strftime(CheckAzurermMonitorMetric::DATE_FORMAT)}/#{end_date.strftime(CheckAzurermMonitorMetric::DATE_FORMAT)}"
   end
 
@@ -99,11 +100,29 @@ describe 'check monitor metric script' do
   let(:value2) { '2.2' }
   let(:value3) { '2.5' }
 
+  let(:local_auth_url) do
+    "http://localhost:#{local_port}/oauth2/token?resource=https://management.azure.com/"
+  end
+
+  let(:local_port) { '50342' }
+
+  let(:auth_resp) do
+    {
+      access_token: token,
+      resource: 'https://management.azure.com/',
+      token_type: 'Bearer'
+    }
+  end
+
+  let(:token) { 'TOKEN' }
+
   before(:each) do
     mock_result_methods(check_instance)
     allow(MsRestAzure::ApplicationTokenProvider).to receive(:new).and_return(mock_az_provider)
-    allow(mock_az_provider).to receive(:get_authentication_header).and_return('TOKEN')
+    allow(mock_az_provider).to receive(:get_authentication_header).and_return(token)
     stub_request(:get, expected_url).to_return(body: JSON.dump(metric_resp))
+
+    stub_request(:get, local_auth_url).to_return(body: JSON.dump(auth_resp))
   end
 
   context 'When metric not over thresholds' do
@@ -117,7 +136,7 @@ describe 'check monitor metric script' do
       check_instance.run
 
       expect(WebMock).to(have_requested(:get, expected_url).with do |req|
-        expect(req.headers['Authorization']).to eq('TOKEN')
+        expect(req.headers['Authorization']).to eq(token)
       end)
     end
   end
@@ -270,7 +289,7 @@ describe 'check monitor metric script' do
   context 'When tenant, client, secret, and subscription given' do
     let(:script_args) do
       [
-        '--resource', resource_id,
+        '--resource-id', resource_id,
         '--metric', metric_name,
         '--critical', critical,
         '--tenant', tenant,
@@ -294,10 +313,50 @@ describe 'check monitor metric script' do
     end
   end
 
+  context 'When use-local-identity option enabled' do
+    let(:script_args) do
+      [
+        '--resource-id', resource_id,
+        '--metric', metric_name,
+        '--critical', critical,
+        '--use-assigned-identity', 'true'
+      ]
+    end
+
+    it 'authenticates against localhost' do
+      check_instance.run
+
+      expect(WebMock).to(have_requested(:get, local_auth_url).with do |req|
+        expect(req.headers['Metadata']).to eq('true')
+      end)
+    end
+
+    context 'When a different port provided' do
+      let(:script_args) do
+        [
+          '--resource-id', resource_id,
+          '--metric', metric_name,
+          '--critical', critical,
+          '--use-assigned-identity',
+          '--local-auth-port', local_port
+
+        ]
+      end
+
+      let(:local_port) { '5' }
+
+      it 'uses the port to auth' do
+        check_instance.run
+
+        expect(WebMock).to(have_requested(:get, local_auth_url))
+      end
+    end
+  end
+
   context 'When no thresholds given' do
     let(:script_args) do
       [
-        '--resource', resource_id,
+        '--resource-id', resource_id,
         '--metric', metric_name
       ]
     end
@@ -305,7 +364,7 @@ describe 'check monitor metric script' do
     it 'Returns an error' do
       check_instance.run
 
-      expect(check_instance).to have_received(:critical)
+      expect(check_instance).to have_received(:unknown)
     end
   end
 
@@ -363,7 +422,7 @@ describe 'check monitor metric script' do
   context 'When subscription, resource type, namespace, and group given' do
     let(:script_args) do
       [
-        '--resource', resource_name,
+        '--resource-name', resource_name,
         '--subscription', subscription,
         '--resource-type', resource_type,
         '--resource-namespace', resource_namespace,
@@ -394,7 +453,7 @@ describe 'check monitor metric script' do
     context 'And parent given' do
       let(:script_args) do
         [
-          '--resource', resource_name,
+          '--resource-name', resource_name,
           '--subscription', subscription,
           '--resource-type', resource_type,
           '--resource-namespace', resource_namespace,
@@ -424,6 +483,17 @@ describe 'check monitor metric script' do
         # this is needed since the call to unknown that would normally stop execution is mocked out.
         # Therefore, it still makes the URL call, so make sure it returns a correct value always.
         stub_request(:get, /.*management.azure.com.*/).to_return(body: JSON.dump(metric_resp))
+      end
+
+      context 'if neither resource id nor resource name given' do
+        let(:resource_name) { '' }
+        let(:resource_id) { '' }
+
+        it 'Returns unknown' do
+          check_instance.run
+
+          expect(check_instance).to have_received(:unknown)
+        end
       end
 
       context 'And namespace not given' do

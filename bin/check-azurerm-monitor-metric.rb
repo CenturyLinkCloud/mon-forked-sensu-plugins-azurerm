@@ -52,11 +52,30 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
          long: '--clientSecret SECRET',
          default: ENV['ARM_CLIENT_SECRET']
 
+  option :use_assigned_identity,
+         description: 'Use Managed Service Identity (MSI) for authentication.',
+         short: '-l',
+         long: '--use-assigned-identity',
+         boolean: true,
+         default: false
+
+  option :local_auth_port,
+         description: 'Port used to authenticate when using the local identity via Managed Service Identity (MSI)',
+         short: '-o PORT',
+         long: '--local-auth-port PORT',
+         default: '50342'
+
   option :subscription_id,
          description: 'ARM Subscription ID',
          short: '-S ID',
          long: '--subscription ID',
          default: ENV['ARM_SUBSCRIPTION_ID']
+
+  option :resource_name,
+         description:  'The name of the resource.  If given, the resource namespace/type/group along with subscription id are also required.',
+         short: '-e NAME',
+         long: '--resource-name NAME',
+         default: ''
 
   option :resource_type,
          description: 'Resource Type.  If specified, the resource should contain the name and not the full id, and the ' \
@@ -85,11 +104,11 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
          default: ''
 
   # example id: /subscriptions/576b7196-d42b-4b63-b696-af3ff33269a7/resourceGroups/test-group-1/providers/Microsoft.Network/virtualNetworkGateways/test-gateway
-  option :resource,
-         description:  'Either the full id or name of the resource.  If the name is given, then resource type/namespace/group and subscription are required.',
+  option :resource_id,
+         description:  'The full id of the resource.  If given, the resource namespace/type/group along with subscription id are ignored.',
          short: '-r ID',
-         long: '--resource ID',
-         required: true
+         long: '--resource-id ID',
+         default: ''
 
   option :metric,
          description:  'The name of the metric',
@@ -132,19 +151,17 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
          long: '--critical-under CRIT',
          proc: proc { |val| val.to_i }
 
-  def parse_dimensions(val)
-    val.split(',')
-       .collect { |dim_str| dim_str.split '=' }
-       .collect { |dim_arr| { name: dim_arr[0], value: dim_arr[1] } }
-  end
-
   def run
+    if config[:resource_id].to_s.empty? && config[:resource_name].to_s.empty?
+      unknown 'resource id or resource name/group/type/namespece and subscription id must be provided'
+    end
+
     if !config[:critical_over] && !config[:warning_over] && !config[:critical_under] && !config[:warning_under]
-      critical 'At least one threshold must be provided.'
+      unknown 'At least one threshold must be provided.'
     end
 
     if last_metric_values.empty?
-      unknown "There are no metric values for #{config[:metric]} on resource #{config[:resource]} with aggregation #{config[:aggregation]}"
+      unknown "There are no metric values for #{config[:metric]} on resource #{config[:resource_id] || config[:resource_name]} with aggregation #{config[:aggregation]}"
     else
       last_metric_values.each do |metric_val|
         if config[:critical_over] && metric_val[:value] > config[:critical_over].to_f
@@ -191,11 +208,29 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
   end
 
   def metric_response
-    provider = MsRestAzure::ApplicationTokenProvider.new(
-      config[:tenant_id],
-      config[:client_id],
-      config[:client_secret]
-    )
+    auth_header = if config[:use_assigned_identity]
+                    uri = URI.parse("http://localhost:#{config[:local_auth_port]}/oauth2/token?resource=https://management.azure.com/")
+
+                    res = Net::HTTP.start(uri.host, uri.port, use_ssl: false) do |http|
+                      req = Net::HTTP::Get.new(uri)
+                      req['Metadata'] = 'true'
+                      http.request(req)
+                    end
+
+                    handle_response(res)
+
+                    auth_resp = JSON.parse(res.body, symbolize_names: true)
+
+                    "#{auth_resp[:token_type]} #{auth_resp[:access_token]}"
+                  else
+                    provider = MsRestAzure::ApplicationTokenProvider.new(
+                      config[:tenant_id],
+                      config[:client_id],
+                      config[:client_secret]
+                    )
+
+                    provider.get_authentication_header
+                  end
 
     begin
       url = "https://management.azure.com#{resource}/providers/microsoft.insights/metrics?" \
@@ -210,7 +245,7 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
 
       res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
         req = Net::HTTP::Get.new(uri)
-        req['Authorization'] = provider.get_authentication_header
+        req['Authorization'] = auth_header
         req['Content-Type'] = 'application/json'
         http.request(req)
       end
@@ -233,7 +268,7 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
   end
 
   def build_resource
-    if !config[:resource_type].to_s.empty? || !config[:resource_namespace].to_s.empty? || !config[:resource_group].to_s.empty?
+    if !config[:resource_name].to_s.empty?
 
       if config[:resource_type].to_s.empty? ||
          config[:resource_namespace].to_s.empty? ||
@@ -243,10 +278,10 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
         unknown 'If resource type, namespace, or group is given, then all are required along with the subscription id.'
       else
         "/subscriptions/#{config[:subscription_id]}/resourceGroups/#{config[:resource_group]}/" \
-          "providers/#{resource_type}/#{config[:resource]}"
+          "providers/#{resource_type}/#{config[:resource_name]}"
       end
     else
-      config[:resource].start_with?('/') ? config[:resource] : '/' + config[:resource]
+      config[:resource_id].start_with?('/') ? config[:resource_id] : '/' + config[:resource_id]
     end
   end
 
@@ -266,9 +301,6 @@ class CheckAzurermMonitorMetric < Sensu::Plugin::Check::CLI
   end
 
   def handle_response(res)
-    case res
-    when !Net::HTTPSuccess then
-      critical "Failed to get metric:\n#{res.body}"
-    end
+    critical "Failed to get metric:\n#{res.body}" if res.code.to_i >= 300
   end
 end
